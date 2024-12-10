@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-NUTRITION_API_URL = "https://starfish-app-fycwd.ondigitalocean.app/api/nutrition"
+NUTRITION_API_URL = "https://bytemi-fdc-api-etgrn.ondigitalocean.app/v1/calculate-macros"
 
 try:
     with open("test_config.json", 'r') as f:
