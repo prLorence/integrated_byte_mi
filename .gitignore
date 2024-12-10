@@ -1,0 +1,10 @@
+**/**/venv
+**/**/repopack-output.txt
+**/**/logs
+**/**/__pycache__
+**/**/*.h5
+**/**/data
+**/**/test_images
+**/**/return
+**/**/visualization_results
+*.h5

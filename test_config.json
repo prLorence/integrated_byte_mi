@@ -1,0 +1,8 @@
+{
+    "data_dir": "test_images",
+    "output_dir": "data/upscaled",
+    "coco_file": "return/_annotations.coco.json",
+    "camera_height": 33.0,
+    "plate_diameter": 25.5,
+    "plate_height": 0.7
+}
