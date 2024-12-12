@@ -141,3 +141,4 @@ class DepthNoiseReducer:
             
         logger.info("Completed depth noise reduction")
         return final_depth
+
