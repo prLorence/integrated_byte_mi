@@ -1,109 +1,90 @@
-def calculate_volume(self, depth_map: np.ndarray,
-                    mask: np.ndarray,
-                    plate_height: float,
-                    intrinsic_params: Dict,
-                    calibration: Optional[Dict] = None) -> Dict[str, float]:
-    """Calculate volume with corrected scaling factors."""
+def calculate_plate_reference(self, depth_map: np.ndarray,
+                            plate_mask: np.ndarray,
+                            intrinsic_params: Dict) -> Dict[str, float]:
+    """Calculate plate reference measurements with robust handling of pseudo depth data."""
     try:
-        if not np.any(mask):
-            raise ValueError("Empty mask provided")
-
         # Validate depth data
-        depth_stats = self._validate_depth_map(depth_map, mask)
+        depth_stats = self._validate_depth_map(depth_map, plate_mask)
         if not depth_stats['is_valid']:
-            logger.warning(f"Using fallback calculation: {depth_stats['reason']}")
-            return self._calculate_volume_from_area(mask, calibration)
+            logger.warning(f"Unreliable plate depth data: {depth_stats['reason']}")
 
-        # Get masked depths and apply smoothing
-        masked_depths = depth_map[mask > 0]
-        if len(masked_depths) == 0:
-            return self._calculate_volume_from_area(mask, calibration)
+        # Convert mask to uint8 for OpenCV operations
+        plate_mask_uint8 = plate_mask.astype(np.uint8)
+        
+        # Get plate depths with smoothing
+        plate_depths = depth_map[plate_mask > 0]
+        if len(plate_depths) == 0:
+            raise ValueError("No depth values in plate region")
+            
+        plate_depths = self._smooth_depths(plate_depths)
 
-        masked_depths = self._smooth_depths(masked_depths)
-
-        # Calculate depth scale (corrected for ARCore depth values)
+        # Calculate depth scale
         depth_range = np.ptp(depth_map)
-        raw_min = np.min(depth_map[depth_map > 0])
-        depth_scale = 0.1  # Fixed scale factor for pseudo depth
+        if depth_range < 1:
+            logger.warning("Very small depth range, using default scale")
+            depth_scale = 0.1
+        else:
+            depth_scale = (self.camera_height - self.plate_height) / depth_range
+            
+        plate_depths_cm = plate_depths * depth_scale / 10
+
+        # Get plate dimensions using contour
+        contours, _ = cv2.findContours(plate_mask_uint8, cv2.RETR_EXTERNAL, 
+                                     cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            raise ValueError("No plate contour found")
+            
+        plate_contour = max(contours, key=cv2.contourArea)
+        (center_x, center_y), radius = cv2.minEnclosingCircle(plate_contour)
         
-        # Convert depths to relative heights
-        heights = np.abs(masked_depths - raw_min) * depth_scale
-        heights = np.clip(heights, 0, self.MAX_FOOD_HEIGHT)
+        # Calculate pixel to cm conversion
+        pixel_to_cm = self.plate_diameter / (2 * radius)
 
-        # Get shape characteristics
-        shape_metrics = self._analyze_shape(mask)
-        solidity = shape_metrics['solidity']
-        aspect_ratio = shape_metrics['aspect_ratio']
-
-        # Determine object type and adjustment factors (reduced factors)
-        if solidity > 0.85:  # Compact (egg)
-            area_factor = 0.95
-            height_factor = 0.6
-            volume_factor = 0.9
-            max_expected_height = 3.0
-        elif aspect_ratio > 2.0:  # Elongated (cucumber)
-            area_factor = 0.85
-            height_factor = 0.5
-            volume_factor = 0.7
-            max_expected_height = 2.5
-        else:  # Spread (rice)
-            area_factor = 0.8
-            height_factor = 0.4
-            volume_factor = 1.1
-            max_expected_height = 2.0
-
-        # Scale heights to expected range
-        height_scale = max_expected_height / np.max(heights) if np.max(heights) > 0 else 1.0
-        heights *= height_scale
-
-        # Calculate base area with reduced scaling
-        pixel_to_cm = calibration.get('pixel_to_cm', 0.1)
-        base_area = np.sum(mask) * (pixel_to_cm ** 2) * area_factor
-        base_area *= 0.2  # Reduced area scaling
-
-        # Calculate volume using weighted heights
-        sorted_heights = np.sort(heights)
-        weights = np.linspace(0.8, 1.0, len(sorted_heights))
-        avg_height = np.average(sorted_heights, weights=weights) * height_factor
-
-        # Calculate volume
-        volume_cm3 = base_area * avg_height * volume_factor
+        # Calculate plate height using central region
+        center_mask = np.zeros_like(plate_mask_uint8)
+        cv2.circle(center_mask, (int(center_x), int(center_y)), 
+                  int(radius * 0.3), 1, -1)
         
-        # Apply calibration with tighter bounds
-        if calibration and 'scale_factor' in calibration:
-            scale_factor = np.clip(calibration['scale_factor'], 0.5, 1.5)
-            volume_cm3 *= scale_factor
+        center_depths = depth_map[center_mask > 0]
+        if len(center_depths) > 0:
+            center_depths = self._smooth_depths(center_depths)
+            plate_height = np.median(center_depths * depth_scale / 10)
+        else:
+            plate_height = np.median(plate_depths_cm)
 
-        # Convert to cups with tighter bounds
-        volume_cm3 = np.clip(volume_cm3, 0.1, 200.0)
-        volume_cups = volume_cm3 * self.CM3_TO_CUPS
+        # Calculate scale factor
+        measured_area = cv2.contourArea(plate_contour) * (pixel_to_cm ** 2)
+        actual_area = np.pi * (self.plate_diameter/2)**2
+        scale_factor = actual_area / max(measured_area, 0.001)
+        scale_factor = np.clip(scale_factor, 0.5, 1.5)
 
-        # Calculate uncertainty and stability
+        # Calculate stability score for plate measurements
         stability_score = self._assess_measurement_stability(
-            masked_depths, heights, shape_metrics
-        )
-        uncertainty = self._calculate_uncertainty(
-            len(masked_depths), heights, shape_metrics, stability_score
+            plate_depths,
+            np.full_like(plate_depths, plate_height),
+            {'solidity': 1.0, 'aspect_ratio': 1.0}
         )
 
-        logger.info(f"Volume Calculation Results:")
-        logger.info(f"Object type: {'Compact' if solidity > 0.85 else 'Elongated' if aspect_ratio > 2.0 else 'Spread'}")
-        logger.info(f"Base area: {base_area:.2f} cm²")
-        logger.info(f"Average height: {avg_height:.4f} cm")
-        logger.info(f"Volume: {volume_cm3:.2f} cm³ ({volume_cups:.2f} cups)")
-        logger.info(f"Stability Score: {stability_score:.3f}")
+        logger.info(f"Plate Reference Calculations:")
+        logger.info(f"Depth scale: {depth_scale:.6f}")
+        logger.info(f"Pixel to cm: {pixel_to_cm:.6f}")
+        logger.info(f"Plate height: {plate_height:.4f} cm")
+        logger.info(f"Scale factor: {scale_factor:.4f}")
+        logger.info(f"Stability score: {stability_score:.3f}")
 
         return {
-            'volume_cm3': float(volume_cm3),
-            'volume_cups': float(volume_cups),
-            'uncertainty_cm3': float(uncertainty * volume_cm3),
-            'uncertainty_cups': float(uncertainty * volume_cups),
-            'base_area_cm2': float(base_area),
-            'avg_height_cm': float(avg_height),
-            'max_height_cm': float(np.max(heights)),
+            'scale_factor': float(scale_factor),
+            'plate_height': float(plate_height),
+            'pixel_to_cm': float(pixel_to_cm),
             'stability_score': float(stability_score)
         }
 
     except Exception as e:
-        logger.error(f"Error in volume calculation: {str(e)}")
-        return self._calculate_volume_from_area(mask, calibration)
+        logger.error(f"Error in plate calibration: {str(e)}")
+        # Return reasonable defaults
+        return {
+            'scale_factor': 1.0,
+            'plate_height': self.camera_height - 1.0,
+            'pixel_to_cm': 0.1,
+            'stability_score': 0.5
+        }
