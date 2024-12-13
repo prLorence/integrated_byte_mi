@@ -32,8 +32,126 @@ except Exception as e:
     logger.error(f"Failed to initialize ModelSingleton: {e}")
     raise
 
+def fetch_nutrition_data(volumes):
+    # Prepare request data for nutrition API
+    nutrition_requests = []
+    
+    for vol in volumes:
+        min_volume = max(0, vol['volume_cups'] - vol['uncertainty_cups'])
+        max_volume = vol['volume_cups'] + vol['uncertainty_cups']
+        
+        nutrition_requests.append({
+            "min": {
+                "food_name": vol['object_name'],
+                "volume": min_volume
+            },
+            "expected": {
+                "food_name": vol['object_name'],
+                "volume": vol['volume_cups']
+            },
+            "max": {
+                "food_name": vol['object_name'],
+                "volume": max_volume
+            }
+        })
+    
+    try:
+        results = []
+        for req in nutrition_requests:
+            # Get min, expected, and max nutritional values
+            min_response = requests.post(NUTRITION_API_URL, json={"data": [req["min"]]}).json()
+            exp_response = requests.post(NUTRITION_API_URL, json={"data": [req["expected"]]}).json()
+            max_response = requests.post(NUTRITION_API_URL, json={"data": [req["max"]]}).json()
+            
+            if not all(response.get('data') for response in [min_response, exp_response, max_response]):
+                logger.error(f"Invalid response for {req['expected']['food_name']}")
+                continue
+                
+            food_result = {
+                "food_name": req["expected"]["food_name"],
+                "volume": {
+                    "min": round(req["min"]["volume"], 3),
+                    "expected": round(req["expected"]["volume"], 3),
+                    "max": round(req["max"]["volume"], 3)
+                },
+                "macros": {
+                    "calories": {
+                        "min": round(min_response["data"][0]["macros"]["calories"], 1),
+                        "expected": round(exp_response["data"][0]["macros"]["calories"], 1),
+                        "max": round(max_response["data"][0]["macros"]["calories"], 1)
+                    },
+                    "protein": {
+                        "min": round(min_response["data"][0]["macros"]["protein"], 1),
+                        "expected": round(exp_response["data"][0]["macros"]["protein"], 1),
+                        "max": round(max_response["data"][0]["macros"]["protein"], 1)
+                    },
+                    "carbs": {
+                        "min": round(min_response["data"][0]["macros"]["carbs"], 1),
+                        "expected": round(exp_response["data"][0]["macros"]["carbs"], 1),
+                        "max": round(max_response["data"][0]["macros"]["carbs"], 1)
+                    },
+                    "fat": {
+                        "min": round(min_response["data"][0]["macros"]["fat"], 1),
+                        "expected": round(exp_response["data"][0]["macros"]["fat"], 1),
+                        "max": round(max_response["data"][0]["macros"]["fat"], 1)
+                    }
+                },
+                "serving_info": exp_response["data"][0]["ServingInfo"],
+                "uncertainty": {
+                    "volume_uncertainty": vol['uncertainty_cups'],
+                    "volume_uncertainty_percent": round((vol['uncertainty_cups'] / vol['volume_cups']) * 100, 1)
+                }
+            }
+            results.append(food_result)
+            
+        totals = {
+            "calories": {
+                "min": round(sum(r["macros"]["calories"]["min"] for r in results), 1),
+                "expected": round(sum(r["macros"]["calories"]["expected"] for r in results), 1),
+                "max": round(sum(r["macros"]["calories"]["max"] for r in results), 1)
+            },
+            "protein": {
+                "min": round(sum(r["macros"]["protein"]["min"] for r in results), 1),
+                "expected": round(sum(r["macros"]["protein"]["expected"] for r in results), 1),
+                "max": round(sum(r["macros"]["protein"]["max"] for r in results), 1)
+            },
+            "carbs": {
+                "min": round(sum(r["macros"]["carbs"]["min"] for r in results), 1),
+                "expected": round(sum(r["macros"]["carbs"]["expected"] for r in results), 1),
+                "max": round(sum(r["macros"]["carbs"]["max"] for r in results), 1)
+            },
+            "fat": {
+                "min": round(sum(r["macros"]["fat"]["min"] for r in results), 1),
+                "expected": round(sum(r["macros"]["fat"]["expected"] for r in results), 1),
+                "max": round(sum(r["macros"]["fat"]["max"] for r in results), 1)
+            }
+        }
+        
+        for macro in totals:
+            expected = totals[macro]["expected"]
+            if expected > 0:
+                totals[macro]["uncertainty_percent"] = round(
+                    ((totals[macro]["max"] - totals[macro]["min"]) / (2 * expected)) * 100, 1
+                )
+            else:
+                totals[macro]["uncertainty_percent"] = 0
+        
+        return {
+            "data": results,
+            "totals": totals,
+            "metadata": {
+                "timestamp": datetime.now().isoformat(),
+                "number_of_items": len(results)
+            }
+        }
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to fetch nutrition data: {e}", exc_info=True)
+        return {"error": "Unable to fetch nutrition data"}
+
 @app.route('/process', methods=['POST'])
 def process_image():
+    """Process uploaded image and return volume and nutrition estimates with uncertainties."""
     try:
         # Validate required form fields
         required_fields = ['rgb_image', 'depth_image', 'rgb_meta', 'depth_meta']
@@ -53,7 +171,6 @@ def process_image():
                 'success': False,
                 'error': f'Invalid metadata format: {str(e)}'
             }), 400
-        
 
         # Get timestamp for frame ID
         timestamp = rgb_meta.get('timestamp')
@@ -86,16 +203,20 @@ def process_image():
         with open(depth_meta_path, 'w') as f:
             json.dump(depth_meta, f, indent=2)
 
+        # Run detection pipeline
         run_detection_pipeline(rgb_path, model_singleton, frame_id)
+        
         # Run preprocessing and volume calculation
         processed_frames = process_frames(config, frame_id)
 
+        # Get nutrition data with uncertainty ranges
         macro_response = fetch_nutrition_data(processed_frames['volumes'])
 
         return jsonify({
             'success': True,
             'data': processed_frames,
             'macronutrients': macro_response,
+            'timestamp': datetime.now().isoformat()
         })
 
     except Exception as e:
@@ -105,29 +226,9 @@ def process_image():
             'error': str(e)
         }), 500
 
-def fetch_nutrition_data(volumes):
-    # Prepare request data for nutrition API
-    nutrition_request = {
-        "data": [
-            {
-                "food_name": obj['object_name'],
-                "volume": obj['volume_cups']
-            }
-            for obj in volumes
-        ]
-    }
-    
-    try:
-        # Make a POST request to the nutrition API
-        response = requests.post(NUTRITION_API_URL, json=nutrition_request)
-        response.raise_for_status()  # Raise exception for HTTP errors
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch nutrition data: {e}", exc_info=True)
-        return {"error": "Unable to fetch nutrition data"}
-
 @app.route('/health', methods=['GET'])
 def health_check():
+    """Health check endpoint"""
     return jsonify({'status': 'healthy'}), 200
 
 if __name__ == '__main__':
